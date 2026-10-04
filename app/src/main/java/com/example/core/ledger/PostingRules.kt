@@ -813,7 +813,346 @@ object PostingRules {
             lines = lines
         )
     }
+
+    /**
+     * Opening Balance Compound Entry:
+     * Accepts a list of initial debit/credit lines.
+     * Difference between debits and credits is balanced into 3301 (Retained Earnings / Equity).
+     */
+    fun createOpeningBalanceDraft(
+        initialLines: List<OpeningBalanceLineSpec>,
+        dateEpochDay: Long,
+        memo: String
+    ): JournalDraft {
+        require(initialLines.isNotEmpty()) { "Opening balance must contain lines" }
+
+        val lines = mutableListOf<JournalDraftLine>()
+        var lineNo = 1
+        initialLines.forEach { spec ->
+            if (spec.debitMinor > 0L || spec.creditMinor > 0L) {
+                lines.add(
+                    JournalDraftLine(
+                        lineNo = lineNo++,
+                        accountCode = spec.accountCode,
+                        partyId = spec.partyId,
+                        treasuryId = spec.treasuryId,
+                        origMinor = if (spec.debitMinor > 0L) spec.debitMinor else spec.creditMinor,
+                        currency = CurrencyCode.FUNCTIONAL,
+                        exchangeRateMicros = ExchangeRate.SCALE_MICROS,
+                        baseDebitMinor = spec.debitMinor,
+                        baseCreditMinor = spec.creditMinor,
+                        memo = spec.memo
+                    )
+                )
+            }
+        }
+
+        val totalDebit = lines.sumOf { it.baseDebitMinor }
+        val totalCredit = lines.sumOf { it.baseCreditMinor }
+        val discrepancy = totalDebit - totalCredit
+
+        if (discrepancy > 0L) {
+            // Debits exceed credits: Balance with Credit to 3301
+            lines.add(
+                JournalDraftLine(
+                    lineNo = lineNo,
+                    accountCode = AccountConstants.RETAINED_EARNINGS,
+                    origMinor = discrepancy,
+                    currency = CurrencyCode.FUNCTIONAL,
+                    exchangeRateMicros = ExchangeRate.SCALE_MICROS,
+                    baseDebitMinor = 0L,
+                    baseCreditMinor = discrepancy,
+                    memo = "رصيد افتتاحي متمم في الأرباح المرحّلة"
+                )
+            )
+        } else if (discrepancy < 0L) {
+            // Credits exceed debits: Balance with Debit to 3301
+            val absDiff = kotlin.math.abs(discrepancy)
+            lines.add(
+                JournalDraftLine(
+                    lineNo = lineNo,
+                    accountCode = AccountConstants.RETAINED_EARNINGS,
+                    origMinor = absDiff,
+                    currency = CurrencyCode.FUNCTIONAL,
+                    exchangeRateMicros = ExchangeRate.SCALE_MICROS,
+                    baseDebitMinor = absDiff,
+                    baseCreditMinor = 0L,
+                    memo = "عجز رصيد افتتاحي متمم في الأرباح المرحّلة"
+                )
+            )
+        }
+
+        return JournalDraft(
+            type = JournalEntryType.NORMAL,
+            entryDateEpochDay = dateEpochDay,
+            memo = memo,
+            lines = lines
+        )
+    }
+
+    /**
+     * Asset Disposal Entry:
+     * CR 1501 (Cost)
+     * DR 1599 (Accumulated Depreciation)
+     * DR Treasury (Proceeds received)
+     * Balance to 5299 (Loss on disposal) or 4201 (Gain on disposal)
+     */
+    fun createAssetDisposalDraft(
+        costMinor: Long,
+        accumulatedDepreciationMinor: Long,
+        salvageProceedsMinor: Long,
+        treasuryGlCode: String?,
+        treasuryId: String?,
+        dateEpochDay: Long,
+        memo: String
+    ): JournalDraft {
+        val lines = mutableListOf<JournalDraftLine>()
+        var lineNo = 1
+
+        // 1. Clear Accumulated Depreciation: DR 1599
+        if (accumulatedDepreciationMinor > 0L) {
+            lines.add(
+                JournalDraftLine(
+                    lineNo = lineNo++,
+                    accountCode = AccountConstants.ACCUMULATED_DEPRECIATION,
+                    origMinor = accumulatedDepreciationMinor,
+                    currency = CurrencyCode.FUNCTIONAL,
+                    exchangeRateMicros = ExchangeRate.SCALE_MICROS,
+                    baseDebitMinor = accumulatedDepreciationMinor,
+                    baseCreditMinor = 0L,
+                    memo = "إقفال مجمع إهلاك الأصل المستبعد"
+                )
+            )
+        }
+
+        // 2. Record cash proceeds if sold: DR Treasury
+        if (salvageProceedsMinor > 0L && treasuryGlCode != null && treasuryId != null) {
+            lines.add(
+                JournalDraftLine(
+                    lineNo = lineNo++,
+                    accountCode = treasuryGlCode,
+                    treasuryId = treasuryId,
+                    origMinor = salvageProceedsMinor,
+                    currency = CurrencyCode.FUNCTIONAL,
+                    exchangeRateMicros = ExchangeRate.SCALE_MICROS,
+                    baseDebitMinor = salvageProceedsMinor,
+                    baseCreditMinor = 0L,
+                    memo = "عائدات بيع الأصل المستبعد"
+                )
+            )
+        }
+
+        // 3. Remove Original Cost: CR 1501
+        lines.add(
+            JournalDraftLine(
+                lineNo = lineNo++,
+                accountCode = AccountConstants.FIXED_ASSETS_NETWORK,
+                origMinor = costMinor,
+                currency = CurrencyCode.FUNCTIONAL,
+                exchangeRateMicros = ExchangeRate.SCALE_MICROS,
+                baseDebitMinor = 0L,
+                baseCreditMinor = costMinor,
+                memo = "استبعاد التكلفة التاريخية للأصل"
+            )
+        )
+
+        // 4. Net book value vs proceeds: Loss or Gain
+        val currentDebits = lines.sumOf { it.baseDebitMinor }
+        val currentCredits = lines.sumOf { it.baseCreditMinor }
+        val diff = currentCredits - currentDebits
+
+        if (diff > 0L) {
+            // Loss on disposal: DR 5299
+            lines.add(
+                JournalDraftLine(
+                    lineNo = lineNo,
+                    accountCode = AccountConstants.MISC_EXPENSES,
+                    origMinor = diff,
+                    currency = CurrencyCode.FUNCTIONAL,
+                    exchangeRateMicros = ExchangeRate.SCALE_MICROS,
+                    baseDebitMinor = diff,
+                    baseCreditMinor = 0L,
+                    memo = "خسارة استبعاد/تخريد أصل شبكة"
+                )
+            )
+        } else if (diff < 0L) {
+            // Gain on disposal: CR 4201
+            val gain = kotlin.math.abs(diff)
+            lines.add(
+                JournalDraftLine(
+                    lineNo = lineNo,
+                    accountCode = AccountConstants.DIRECT_SERVICE_REVENUE,
+                    origMinor = gain,
+                    currency = CurrencyCode.FUNCTIONAL,
+                    exchangeRateMicros = ExchangeRate.SCALE_MICROS,
+                    baseDebitMinor = 0L,
+                    baseCreditMinor = gain,
+                    memo = "أرباح رأسمالية من بيع أصل شبكة"
+                )
+            )
+        }
+
+        return JournalDraft(
+            type = JournalEntryType.NORMAL,
+            entryDateEpochDay = dateEpochDay,
+            memo = memo,
+            lines = lines
+        )
+    }
+
+    /**
+     * Cash Count Discrepancy Adjustment:
+     * Actual < Book: DR 5299 (Shortage), CR Treasury
+     * Actual > Book: DR Treasury, CR 4201 (Surplus)
+     */
+    fun createCashReconciliationDraft(
+        treasuryGlCode: String,
+        treasuryId: String,
+        discrepancyMinor: Long, // Positive = Surplus, Negative = Shortage
+        currency: CurrencyCode,
+        exchangeRate: ExchangeRate,
+        dateEpochDay: Long,
+        memo: String
+    ): JournalDraft {
+        require(discrepancyMinor != 0L) { "Discrepancy must be non-zero" }
+        val absOrig = kotlin.math.abs(discrepancyMinor)
+        val absBase = exchangeRate.convert(absOrig)
+
+        val lines = if (discrepancyMinor < 0L) {
+            // Shortage: DR 5299, CR Treasury
+            listOf(
+                JournalDraftLine(
+                    lineNo = 1,
+                    accountCode = AccountConstants.MISC_EXPENSES,
+                    origMinor = absOrig,
+                    currency = currency,
+                    exchangeRateMicros = exchangeRate.rateMicros,
+                    baseDebitMinor = absBase,
+                    baseCreditMinor = 0L,
+                    memo = "عجز جرد صندوق: $memo"
+                ),
+                JournalDraftLine(
+                    lineNo = 2,
+                    accountCode = treasuryGlCode,
+                    treasuryId = treasuryId,
+                    origMinor = absOrig,
+                    currency = currency,
+                    exchangeRateMicros = exchangeRate.rateMicros,
+                    baseDebitMinor = 0L,
+                    baseCreditMinor = absBase,
+                    memo = "تسوية عجز جرد الصندوق"
+                )
+            )
+        } else {
+            // Surplus: DR Treasury, CR 4201
+            listOf(
+                JournalDraftLine(
+                    lineNo = 1,
+                    accountCode = treasuryGlCode,
+                    treasuryId = treasuryId,
+                    origMinor = absOrig,
+                    currency = currency,
+                    exchangeRateMicros = exchangeRate.rateMicros,
+                    baseDebitMinor = absBase,
+                    baseCreditMinor = 0L,
+                    memo = "تسوية فائض جرد الصندوق"
+                ),
+                JournalDraftLine(
+                    lineNo = 2,
+                    accountCode = AccountConstants.DIRECT_SERVICE_REVENUE,
+                    origMinor = absOrig,
+                    currency = currency,
+                    exchangeRateMicros = exchangeRate.rateMicros,
+                    baseDebitMinor = 0L,
+                    baseCreditMinor = absBase,
+                    memo = "فائض جرد صندوق: $memo"
+                )
+            )
+        }
+
+        return JournalDraft(
+            type = JournalEntryType.NORMAL,
+            entryDateEpochDay = dateEpochDay,
+            memo = memo,
+            lines = lines
+        )
+    }
+
+    /**
+     * Dividend Distribution:
+     * DR 3301 (Retained Earnings)
+     * CR 3201 (Partner Current Accounts)
+     */
+    fun createDividendDistributionDraft(
+        totalDividendMinor: Long,
+        partnerShares: List<PartnerDividendSpec>,
+        dateEpochDay: Long,
+        memo: String
+    ): JournalDraft {
+        require(totalDividendMinor > 0L) { "Dividend amount must be positive" }
+        require(partnerShares.isNotEmpty()) { "Partner shares must be provided" }
+
+        val sharesSum = partnerShares.sumOf { it.amountMinor }
+        require(sharesSum == totalDividendMinor) {
+            "Sum of partner dividend shares ($sharesSum) must equal total distribution ($totalDividendMinor)"
+        }
+
+        val lines = mutableListOf<JournalDraftLine>()
+        // 1. DR Retained Earnings (3301)
+        lines.add(
+            JournalDraftLine(
+                lineNo = 1,
+                accountCode = AccountConstants.RETAINED_EARNINGS,
+                origMinor = totalDividendMinor,
+                currency = CurrencyCode.FUNCTIONAL,
+                exchangeRateMicros = ExchangeRate.SCALE_MICROS,
+                baseDebitMinor = totalDividendMinor,
+                baseCreditMinor = 0L,
+                memo = memo
+            )
+        )
+
+        // 2. CR Partner Current (3201) per partner
+        var lineNo = 2
+        partnerShares.forEach { partner ->
+            lines.add(
+                JournalDraftLine(
+                    lineNo = lineNo++,
+                    accountCode = AccountConstants.PARTNER_CURRENT,
+                    partyId = partner.partnerPartyId,
+                    origMinor = partner.amountMinor,
+                    currency = CurrencyCode.FUNCTIONAL,
+                    exchangeRateMicros = ExchangeRate.SCALE_MICROS,
+                    baseDebitMinor = 0L,
+                    baseCreditMinor = partner.amountMinor,
+                    memo = "توزيع أرباح للشريك ${partner.partnerName}"
+                )
+            )
+        }
+
+        return JournalDraft(
+            type = JournalEntryType.NORMAL,
+            entryDateEpochDay = dateEpochDay,
+            memo = memo,
+            lines = lines
+        )
+    }
 }
+
+data class OpeningBalanceLineSpec(
+    val accountCode: String,
+    val partyId: String? = null,
+    val treasuryId: String? = null,
+    val debitMinor: Long = 0L,
+    val creditMinor: Long = 0L,
+    val memo: String = ""
+)
+
+data class PartnerDividendSpec(
+    val partnerPartyId: String,
+    val partnerName: String,
+    val amountMinor: Long
+)
 
 data class PurchaseItemDraft(
     val accountCode: String,

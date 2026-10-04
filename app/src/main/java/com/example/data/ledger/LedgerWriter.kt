@@ -734,6 +734,444 @@ class LedgerWriter(
         true
     }
 
+    /**
+     * Quick Sale (بيع سريع):
+     * Field agent workflow creating a Sales Invoice + Receipt Voucher + Allocation in a single atomic transaction.
+     */
+    suspend fun postQuickSale(
+        partyId: String,
+        packageId: String?,
+        description: String,
+        quantity: Int,
+        unitPriceMinor: Long,
+        cashPaidMinor: Long,
+        treasuryId: String,
+        fiscalYear: Int,
+        dateEpochDay: Long,
+        currency: CurrencyCode = CurrencyCode.YER,
+        exchangeRate: ExchangeRate = ExchangeRate.parity(CurrencyCode.YER),
+        notes: String = "",
+        idempotencyKey: String? = null
+    ): QuickSaleResult = db.withTransaction {
+        // 1. Post Sales Invoice
+        val invoice = postSalesInvoice(
+            partyId = partyId,
+            fiscalYear = fiscalYear,
+            dateEpochDay = dateEpochDay,
+            currency = currency,
+            exchangeRate = exchangeRate,
+            cardItems = listOf(SalesItemSpec(description, quantity, unitPriceMinor, packageId)),
+            serviceItems = emptyList(),
+            notes = if (notes.isBlank()) "بيع سريع: $description" else notes,
+            idempotencyKey = idempotencyKey?.let { "${it}_inv" }
+        )
+
+        // 2. If cash paid, post customer receipt allocated to this invoice
+        val receipt = if (cashPaidMinor > 0L) {
+            val allocatedMinor = minOf(cashPaidMinor, invoice.totalMinor)
+            postCustomerReceipt(
+                partyId = partyId,
+                treasuryId = treasuryId,
+                fiscalYear = fiscalYear,
+                dateEpochDay = dateEpochDay,
+                amountOrigMinor = cashPaidMinor,
+                currency = currency,
+                exchangeRate = exchangeRate,
+                allocations = listOf(InvoiceAllocationSpec(invoice.id, allocatedMinor)),
+                notes = "سند قبض بيع فوري لفاتورة #${invoice.docNumber}",
+                idempotencyKey = idempotencyKey?.let { "${it}_rcv" }
+            )
+        } else {
+            null
+        }
+
+        QuickSaleResult(invoice = invoice, receipt = receipt)
+    }
+
+    /**
+     * Credit Note (مرتجع مبيعات):
+     * DR 4102 (Sales Returns), CR 1201 (Receivables).
+     * Optional card stock return movement.
+     */
+    suspend fun postCreditNote(
+        partyId: String,
+        fiscalYear: Int,
+        dateEpochDay: Long,
+        currency: CurrencyCode,
+        exchangeRate: ExchangeRate,
+        amountOrigMinor: Long,
+        returnPackageId: String? = null,
+        returnQty: Int = 0,
+        notes: String = ""
+    ): DocumentEntity = db.withTransaction {
+        validatePeriodIsOpen(dateEpochDay)
+        val docNumber = allocateNextDocNumber(DocumentType.CREDIT_NOTE.name, fiscalYear)
+        val docId = UuidUtils.newTimeOrderedId()
+        val baseMinor = exchangeRate.convert(amountOrigMinor)
+
+        val docEntity = DocumentEntity(
+            id = docId,
+            type = DocumentType.CREDIT_NOTE.name,
+            fiscalYear = fiscalYear,
+            docNumber = docNumber,
+            partyId = partyId,
+            dateEpochDay = dateEpochDay,
+            currency = currency.name,
+            exchangeRateMicros = exchangeRate.rateMicros,
+            totalMinor = amountOrigMinor,
+            totalBaseMinor = baseMinor,
+            status = DocumentStatus.POSTED.name,
+            notes = notes
+        )
+        db.documentDao().insertDocument(docEntity)
+
+        val draft = PostingRules.createCreditNoteDraft(
+            partyId = partyId,
+            amountOrigMinor = amountOrigMinor,
+            currency = currency,
+            exchangeRate = exchangeRate,
+            dateEpochDay = dateEpochDay,
+            memo = "إشعار دائن مرتجع مبيعات #$docNumber"
+        )
+        persistJournalDraft(docId, docNumber, draft)
+
+        if (returnPackageId != null && returnQty > 0) {
+            db.cardPackageDao().insertStockMovement(
+                StockMovementEntity(
+                    id = UuidUtils.newTimeOrderedId(),
+                    packageId = returnPackageId,
+                    docId = docId,
+                    type = "RETURN",
+                    quantity = returnQty,
+                    movementDateEpochDay = dateEpochDay
+                )
+            )
+        }
+
+        recordAuditLog("DOCUMENT", docId, "POST_CREDIT_NOTE", null, "Posted Credit Note #$docNumber")
+        if (enableInvariantValidation) invariants.verifyAll()
+        docEntity
+    }
+
+    /**
+     * Opening Balance Wizard Entry:
+     * Balanced single compound entry for initial setup.
+     */
+    suspend fun postOpeningBalance(
+        fiscalYear: Int,
+        dateEpochDay: Long,
+        lines: List<com.example.core.ledger.OpeningBalanceLineSpec>,
+        notes: String = ""
+    ): DocumentEntity = db.withTransaction {
+        validatePeriodIsOpen(dateEpochDay)
+        val docNumber = allocateNextDocNumber(DocumentType.OPENING_BALANCE.name, fiscalYear)
+        val docId = UuidUtils.newTimeOrderedId()
+
+        val draft = PostingRules.createOpeningBalanceDraft(
+            initialLines = lines,
+            dateEpochDay = dateEpochDay,
+            memo = if (notes.isBlank()) "قيد افتتاحي عام متوازن #$docNumber" else notes
+        )
+        val totalBase = draft.totalDebitMinor
+
+        val docEntity = DocumentEntity(
+            id = docId,
+            type = DocumentType.OPENING_BALANCE.name,
+            fiscalYear = fiscalYear,
+            docNumber = docNumber,
+            partyId = AppDatabase.WALK_IN_CASH_PARTY_ID,
+            dateEpochDay = dateEpochDay,
+            currency = CurrencyCode.FUNCTIONAL.name,
+            exchangeRateMicros = ExchangeRate.SCALE_MICROS,
+            totalMinor = totalBase,
+            totalBaseMinor = totalBase,
+            status = DocumentStatus.POSTED.name,
+            notes = notes
+        )
+        db.documentDao().insertDocument(docEntity)
+        persistJournalDraft(docId, docNumber, draft)
+
+        recordAuditLog("DOCUMENT", docId, "POST_OPENING_BALANCE", null, "Posted Opening Balance #$docNumber")
+        if (enableInvariantValidation) invariants.verifyAll()
+        docEntity
+    }
+
+    /**
+     * Asset Disposal:
+     * Retires or sells a fixed asset, updating 1501, 1599, Treasury, and gain/loss.
+     */
+    suspend fun disposeAsset(
+        assetId: String,
+        disposalDateEpochDay: Long,
+        salvageProceedsMinor: Long = 0L,
+        treasuryId: String? = null,
+        notes: String = ""
+    ): DocumentEntity = db.withTransaction {
+        validatePeriodIsOpen(disposalDateEpochDay)
+        val asset = db.assetDao().getAssetById(assetId) ?: error("Asset $assetId not found")
+        require(!asset.isDisposed) { "Asset $assetId is already disposed" }
+
+        val treasury = treasuryId?.let { db.treasuryDao().getTreasuryById(it) }
+        val fiscalYear = 1970 + (disposalDateEpochDay / 365).toInt()
+        val docNumber = allocateNextDocNumber("ASSET_DISPOSAL", fiscalYear)
+        val docId = UuidUtils.newTimeOrderedId()
+
+        val draft = PostingRules.createAssetDisposalDraft(
+            costMinor = asset.purchaseCostMinor,
+            accumulatedDepreciationMinor = asset.accumulatedDepreciationMinor,
+            salvageProceedsMinor = salvageProceedsMinor,
+            treasuryGlCode = treasury?.glAccountCode,
+            treasuryId = treasury?.id,
+            dateEpochDay = disposalDateEpochDay,
+            memo = "استبعاد أصل شبكة: ${asset.name}"
+        )
+
+        val docEntity = DocumentEntity(
+            id = docId,
+            type = "ASSET_DISPOSAL",
+            fiscalYear = fiscalYear,
+            docNumber = docNumber,
+            partyId = AppDatabase.WALK_IN_CASH_PARTY_ID,
+            dateEpochDay = disposalDateEpochDay,
+            currency = CurrencyCode.FUNCTIONAL.name,
+            exchangeRateMicros = ExchangeRate.SCALE_MICROS,
+            totalMinor = asset.purchaseCostMinor,
+            totalBaseMinor = asset.purchaseCostMinor,
+            status = DocumentStatus.POSTED.name,
+            notes = notes
+        )
+        db.documentDao().insertDocument(docEntity)
+        persistJournalDraft(docId, docNumber, draft)
+
+        db.assetDao().setAssetDisposed(assetId, true)
+        recordAuditLog("ASSET", assetId, "DISPOSE", "isDisposed=false", "isDisposed=true, proceeds=$salvageProceedsMinor")
+        if (enableInvariantValidation) invariants.verifyAll()
+        docEntity
+    }
+
+    /**
+     * Cash Reconciliation (جرد الخزينة):
+     * Reconciles physical count against book ledger balance.
+     */
+    suspend fun reconcileTreasuryCash(
+        treasuryId: String,
+        actualCountMinor: Long,
+        fiscalYear: Int,
+        dateEpochDay: Long,
+        notes: String = ""
+    ): DocumentEntity? = db.withTransaction {
+        validatePeriodIsOpen(dateEpochDay)
+        val treasury = db.treasuryDao().getTreasuryById(treasuryId) ?: error("Treasury $treasuryId not found")
+        val bookDebitBalance = db.journalDao().getNetDebitBalanceForTreasury(treasuryId)
+        val discrepancyMinor = actualCountMinor - bookDebitBalance
+
+        if (discrepancyMinor == 0L) return@withTransaction null // Perfectly matched, no entry needed
+
+        val currency = CurrencyCode.fromString(treasury.currency)
+        val rate = if (currency == CurrencyCode.FUNCTIONAL) {
+            ExchangeRate.parity(CurrencyCode.FUNCTIONAL)
+        } else {
+            val rateEntity = db.currencyRateDao().getRate(currency.name, CurrencyCode.FUNCTIONAL.name)
+            rateEntity?.let { ExchangeRate(currency, CurrencyCode.FUNCTIONAL, it.rateMicros) }
+                ?: ExchangeRate.parity(currency)
+        }
+
+        val docNumber = allocateNextDocNumber("CASH_RECONCILIATION", fiscalYear)
+        val docId = UuidUtils.newTimeOrderedId()
+        val absOrig = kotlin.math.abs(discrepancyMinor)
+        val absBase = rate.convert(absOrig)
+
+        val draft = PostingRules.createCashReconciliationDraft(
+            treasuryGlCode = treasury.glAccountCode,
+            treasuryId = treasuryId,
+            discrepancyMinor = discrepancyMinor,
+            currency = currency,
+            exchangeRate = rate,
+            dateEpochDay = dateEpochDay,
+            memo = "تسوية جرد صندوق ${treasury.name}"
+        )
+
+        val docEntity = DocumentEntity(
+            id = docId,
+            type = "CASH_RECONCILIATION",
+            fiscalYear = fiscalYear,
+            docNumber = docNumber,
+            partyId = AppDatabase.WALK_IN_CASH_PARTY_ID,
+            dateEpochDay = dateEpochDay,
+            currency = currency.name,
+            exchangeRateMicros = rate.rateMicros,
+            totalMinor = absOrig,
+            totalBaseMinor = absBase,
+            status = DocumentStatus.POSTED.name,
+            notes = notes
+        )
+        db.documentDao().insertDocument(docEntity)
+        persistJournalDraft(docId, docNumber, draft)
+
+        recordAuditLog("TREASURY", treasuryId, "RECONCILE", "book=$bookDebitBalance", "actual=$actualCountMinor, diff=$discrepancyMinor")
+        if (enableInvariantValidation) invariants.verifyAll()
+        docEntity
+    }
+
+    /**
+     * Distribute Dividends to Partners:
+     * DR 3301 (Retained Earnings), CR 3201 (Partner Current).
+     */
+    suspend fun distributeDividends(
+        totalDividendMinor: Long,
+        partnerShares: List<com.example.core.ledger.PartnerDividendSpec>,
+        fiscalYear: Int,
+        dateEpochDay: Long,
+        notes: String = ""
+    ): DocumentEntity = db.withTransaction {
+        validatePeriodIsOpen(dateEpochDay)
+        val docNumber = allocateNextDocNumber(DocumentType.DIVIDEND_DISTRIBUTION.name, fiscalYear)
+        val docId = UuidUtils.newTimeOrderedId()
+
+        val draft = PostingRules.createDividendDistributionDraft(
+            totalDividendMinor = totalDividendMinor,
+            partnerShares = partnerShares,
+            dateEpochDay = dateEpochDay,
+            memo = "توزيع أرباح الشركاء لسنة $fiscalYear"
+        )
+
+        val docEntity = DocumentEntity(
+            id = docId,
+            type = DocumentType.DIVIDEND_DISTRIBUTION.name,
+            fiscalYear = fiscalYear,
+            docNumber = docNumber,
+            partyId = AppDatabase.WALK_IN_CASH_PARTY_ID,
+            dateEpochDay = dateEpochDay,
+            currency = CurrencyCode.FUNCTIONAL.name,
+            exchangeRateMicros = ExchangeRate.SCALE_MICROS,
+            totalMinor = totalDividendMinor,
+            totalBaseMinor = totalDividendMinor,
+            status = DocumentStatus.POSTED.name,
+            notes = notes
+        )
+        db.documentDao().insertDocument(docEntity)
+        persistJournalDraft(docId, docNumber, draft)
+
+        recordAuditLog("DIVIDEND", docId, "DISTRIBUTE_DIVIDENDS", null, "Distributed $totalDividendMinor YER")
+        if (enableInvariantValidation) invariants.verifyAll()
+        docEntity
+    }
+
+    /**
+     * Year-End Closing Entry:
+     * Clears all Revenue (4xxx) balances with Debits and Expense (5xxx) balances with Credits
+     * Net transferred to 3301 (Retained Earnings).
+     * Entry is of type CLOSING so income statements can filter it out.
+     */
+    suspend fun executeYearEndClosing(
+        fiscalYear: Int,
+        closingDateEpochDay: Long,
+        memo: String = ""
+    ): DocumentEntity = db.withTransaction {
+        validatePeriodIsOpen(closingDateEpochDay)
+
+        // Read all 4xxx and 5xxx net balances
+        val accounts = db.accountDao().getAllAccountsSync()
+        val revenueBalances = mutableMapOf<String, Long>()
+        val expenseBalances = mutableMapOf<String, Long>()
+
+        accounts.forEach { acc ->
+            val netDebit = db.journalDao().getNetDebitBalanceForAccount(acc.code)
+            if (acc.code.startsWith("4")) {
+                // Revenue has credit normal: credit balance = -netDebit
+                val creditBal = -netDebit
+                if (creditBal > 0L) revenueBalances[acc.code] = creditBal
+            } else if (acc.code.startsWith("5")) {
+                // Expense has debit normal: debit balance = netDebit
+                if (netDebit > 0L) expenseBalances[acc.code] = netDebit
+            }
+        }
+
+        val draft = PostingRules.createClosingDraft(
+            revenueBalances = revenueBalances,
+            expenseBalances = expenseBalances,
+            dateEpochDay = closingDateEpochDay,
+            memo = if (memo.isBlank()) "قيد إقفال سنوي للسنة المالية $fiscalYear" else memo
+        )
+
+        val docNumber = allocateNextDocNumber(DocumentType.CLOSING_ENTRY.name, fiscalYear)
+        val docId = UuidUtils.newTimeOrderedId()
+        val totalBase = draft.totalDebitMinor
+
+        val docEntity = DocumentEntity(
+            id = docId,
+            type = DocumentType.CLOSING_ENTRY.name,
+            fiscalYear = fiscalYear,
+            docNumber = docNumber,
+            partyId = AppDatabase.WALK_IN_CASH_PARTY_ID,
+            dateEpochDay = closingDateEpochDay,
+            currency = CurrencyCode.FUNCTIONAL.name,
+            exchangeRateMicros = ExchangeRate.SCALE_MICROS,
+            totalMinor = totalBase,
+            totalBaseMinor = totalBase,
+            status = DocumentStatus.POSTED.name,
+            notes = memo
+        )
+        db.documentDao().insertDocument(docEntity)
+        persistJournalDraft(docId, docNumber, draft)
+
+        // Close the period
+        val month = 12
+        db.fiscalPeriodDao().setPeriodClosed(fiscalYear, month, isClosed = true, closedAt = System.currentTimeMillis())
+
+        recordAuditLog("DOCUMENT", docId, "EXECUTE_CLOSING", null, "Executed Year End Closing for $fiscalYear")
+        if (enableInvariantValidation) invariants.verifyAll()
+        docEntity
+    }
+
+    /**
+     * Stock Receive (استلام دفعة كروت جديدة):
+     * Increases card quantity count. No financial journal entry (quantities only).
+     */
+    suspend fun receiveCardStock(
+        packageId: String,
+        quantity: Int,
+        dateEpochDay: Long,
+        notes: String = ""
+    ) = db.withTransaction {
+        require(quantity > 0) { "Received quantity must be positive" }
+        db.cardPackageDao().insertStockMovement(
+            StockMovementEntity(
+                id = UuidUtils.newTimeOrderedId(),
+                packageId = packageId,
+                docId = null,
+                type = "RECEIVE",
+                quantity = quantity,
+                movementDateEpochDay = dateEpochDay
+            )
+        )
+        recordAuditLog("CARD_PACKAGE", packageId, "RECEIVE_STOCK", null, "Received $quantity cards. Notes: $notes")
+    }
+
+    /**
+     * Stock Inventory Adjustment (تسوية جرد كميات كروت):
+     */
+    suspend fun adjustCardStock(
+        packageId: String,
+        adjustmentQty: Int,
+        dateEpochDay: Long,
+        reason: String
+    ) = db.withTransaction {
+        require(adjustmentQty != 0) { "Adjustment quantity cannot be zero" }
+        require(reason.isNotBlank()) { "Adjustment reason is mandatory" }
+        db.cardPackageDao().insertStockMovement(
+            StockMovementEntity(
+                id = UuidUtils.newTimeOrderedId(),
+                packageId = packageId,
+                docId = null,
+                type = "ADJUST",
+                quantity = adjustmentQty,
+                movementDateEpochDay = dateEpochDay
+            )
+        )
+        recordAuditLog("CARD_PACKAGE", packageId, "ADJUST_STOCK", null, "Adjusted by $adjustmentQty cards. Reason: $reason")
+    }
+
     private suspend fun validatePeriodIsOpen(dateEpochDay: Long) {
         // Approximate year and month from epoch day (standard calendar)
         val daysSinceEpoch = dateEpochDay
@@ -840,3 +1278,8 @@ enum class PaymentVoucherType {
     OPERATING_EXPENSE,
     PARTNER_DRAWINGS
 }
+
+data class QuickSaleResult(
+    val invoice: DocumentEntity,
+    val receipt: DocumentEntity?
+)

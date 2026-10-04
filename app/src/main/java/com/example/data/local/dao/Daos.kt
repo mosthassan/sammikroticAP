@@ -45,6 +45,44 @@ data class PartyBalanceRow(
     val netBalanceMinor: Long get() = totalDebitMinor - totalCreditMinor
 }
 
+data class StatementLineRow(
+    val entryId: String,
+    val docId: String,
+    val entryDateEpochDay: Long,
+    val docType: String,
+    val docNumber: Long,
+    val memo: String,
+    val baseDebitMinor: Long,
+    val baseCreditMinor: Long,
+    val origMinor: Long,
+    val currency: String
+)
+
+data class IncomeStatementRow(
+    val accountCode: String,
+    val accountName: String,
+    val totalDebitMinor: Long,
+    val totalCreditMinor: Long,
+    val isDebitNormal: Boolean
+) {
+    // For revenue accounts (4xxx, credit normal): credit - debit
+    // For expense accounts (5xxx, debit normal): debit - credit
+    val netAmountMinor: Long
+        get() = if (isDebitNormal) totalDebitMinor - totalCreditMinor else totalCreditMinor - totalDebitMinor
+}
+
+data class BalanceSheetRow(
+    val accountCode: String,
+    val accountName: String,
+    val accountType: String,
+    val totalDebitMinor: Long,
+    val totalCreditMinor: Long,
+    val isDebitNormal: Boolean
+) {
+    val netBalanceMinor: Long
+        get() = if (isDebitNormal) totalDebitMinor - totalCreditMinor else totalCreditMinor - totalDebitMinor
+}
+
 /**
  * Journal entries and lines write access is restricted exclusively to LedgerWriter.
  */
@@ -59,6 +97,9 @@ internal interface JournalDao {
     @Query("SELECT * FROM journal_entries ORDER BY entryDateEpochDay DESC, entryNumber DESC")
     fun getAllEntriesFlow(): Flow<List<JournalEntryEntity>>
 
+    @Query("SELECT * FROM journal_entries ORDER BY entryDateEpochDay ASC, entryNumber ASC")
+    suspend fun getAllEntriesSync(): List<JournalEntryEntity>
+
     @Query("SELECT * FROM journal_entries WHERE docId = :docId ORDER BY entryNumber ASC")
     suspend fun getEntriesForDocument(docId: String): List<JournalEntryEntity>
 
@@ -67,6 +108,65 @@ internal interface JournalDao {
 
     @Query("SELECT * FROM journal_lines ORDER BY lineNo ASC")
     fun getAllLinesFlow(): Flow<List<JournalLineEntity>>
+
+    @Query("SELECT * FROM journal_lines")
+    suspend fun getAllLinesSync(): List<JournalLineEntity>
+
+    @Query("""
+        SELECT je.id AS entryId, d.id AS docId, je.entryDateEpochDay AS entryDateEpochDay,
+               d.type AS docType, d.docNumber AS docNumber, jl.memo AS memo,
+               jl.baseDebitMinor AS baseDebitMinor, jl.baseCreditMinor AS baseCreditMinor,
+               jl.origMinor AS origMinor, jl.currency AS currency
+        FROM journal_lines jl
+        INNER JOIN journal_entries je ON jl.entryId = je.id
+        INNER JOIN documents d ON je.docId = d.id
+        WHERE jl.partyId = :partyId AND jl.accountCode = :controlAccountCode
+          AND (:startDateEpochDay IS NULL OR je.entryDateEpochDay >= :startDateEpochDay)
+          AND (:endDateEpochDay IS NULL OR je.entryDateEpochDay <= :endDateEpochDay)
+        ORDER BY je.entryDateEpochDay ASC, je.entryNumber ASC
+    """)
+    suspend fun getStatementOfAccountLines(
+        partyId: String,
+        controlAccountCode: String,
+        startDateEpochDay: Long?,
+        endDateEpochDay: Long?
+    ): List<StatementLineRow>
+
+    @Query("""
+        SELECT jl.accountCode AS accountCode, a.name AS accountName,
+               COALESCE(SUM(jl.baseDebitMinor), 0) AS totalDebitMinor,
+               COALESCE(SUM(jl.baseCreditMinor), 0) AS totalCreditMinor,
+               a.isDebitNormal AS isDebitNormal
+        FROM journal_lines jl
+        INNER JOIN journal_entries je ON jl.entryId = je.id
+        INNER JOIN accounts a ON jl.accountCode = a.code
+        WHERE je.type != 'CLOSING'
+          AND (a.code LIKE '4%' OR a.code LIKE '5%')
+          AND (:startDateEpochDay IS NULL OR je.entryDateEpochDay >= :startDateEpochDay)
+          AND (:endDateEpochDay IS NULL OR je.entryDateEpochDay <= :endDateEpochDay)
+        GROUP BY jl.accountCode, a.name, a.isDebitNormal
+        ORDER BY jl.accountCode ASC
+    """)
+    suspend fun getIncomeStatementLines(
+        startDateEpochDay: Long?,
+        endDateEpochDay: Long?
+    ): List<IncomeStatementRow>
+
+    @Query("""
+        SELECT a.code AS accountCode, a.name AS accountName, a.type AS accountType,
+               COALESCE(SUM(jl.baseDebitMinor), 0) AS totalDebitMinor,
+               COALESCE(SUM(jl.baseCreditMinor), 0) AS totalCreditMinor,
+               a.isDebitNormal AS isDebitNormal
+        FROM accounts a
+        LEFT JOIN journal_lines jl ON a.code = jl.accountCode
+        LEFT JOIN journal_entries je ON jl.entryId = je.id AND (:asOfDateEpochDay IS NULL OR je.entryDateEpochDay <= :asOfDateEpochDay)
+        WHERE (a.code LIKE '1%' OR a.code LIKE '2%' OR a.code LIKE '3%')
+        GROUP BY a.code, a.name, a.type, a.isDebitNormal
+        ORDER BY a.code ASC
+    """)
+    suspend fun getBalanceSheetLines(
+        asOfDateEpochDay: Long?
+    ): List<BalanceSheetRow>
 
     @Query("""
         SELECT a.code AS accountCode, a.name AS accountName,
@@ -149,11 +249,17 @@ interface DocumentDao {
     @Query("SELECT * FROM documents ORDER BY dateEpochDay DESC, docNumber DESC")
     fun getAllDocumentsFlow(): Flow<List<DocumentEntity>>
 
+    @Query("SELECT * FROM documents ORDER BY dateEpochDay ASC, docNumber ASC")
+    suspend fun getAllDocumentsSync(): List<DocumentEntity>
+
     @Query("SELECT * FROM documents WHERE type = :type ORDER BY dateEpochDay DESC, docNumber DESC")
     fun getDocumentsByTypeFlow(type: String): Flow<List<DocumentEntity>>
 
     @Query("SELECT * FROM document_items WHERE docId = :docId ORDER BY itemIndex ASC")
     suspend fun getItemsForDocument(docId: String): List<DocumentItemEntity>
+
+    @Query("SELECT * FROM document_items")
+    suspend fun getAllDocumentItemsSync(): List<DocumentItemEntity>
 }
 
 @Dao
@@ -164,11 +270,17 @@ interface PartyDao {
     @Update
     suspend fun updateParty(party: PartyEntity)
 
+    @Query("UPDATE parties SET isActive = :isActive WHERE id = :id")
+    suspend fun setPartyActive(id: String, isActive: Boolean)
+
     @Query("SELECT * FROM parties WHERE id = :id")
     suspend fun getPartyById(id: String): PartyEntity?
 
     @Query("SELECT * FROM parties ORDER BY name ASC")
     fun getAllPartiesFlow(): Flow<List<PartyEntity>>
+
+    @Query("SELECT * FROM parties ORDER BY name ASC")
+    suspend fun getAllPartiesSync(): List<PartyEntity>
 
     @Query("SELECT * FROM parties WHERE isCustomer = 1 ORDER BY name ASC")
     fun getCustomersFlow(): Flow<List<PartyEntity>>
@@ -218,6 +330,12 @@ interface FiscalPeriodDao {
     @Query("SELECT * FROM fiscal_periods WHERE year = :year AND month = :month")
     suspend fun getPeriod(year: Int, month: Int): FiscalPeriodEntity?
 
+    @Query("SELECT * FROM fiscal_periods ORDER BY year DESC, month DESC")
+    fun getAllPeriodsFlow(): Flow<List<FiscalPeriodEntity>>
+
+    @Query("SELECT * FROM fiscal_periods ORDER BY year DESC, month DESC")
+    suspend fun getAllPeriodsSync(): List<FiscalPeriodEntity>
+
     @Query("UPDATE fiscal_periods SET isClosed = :isClosed, closedAt = :closedAt WHERE year = :year AND month = :month")
     suspend fun setPeriodClosed(year: Int, month: Int, isClosed: Boolean, closedAt: Long?)
 }
@@ -232,6 +350,12 @@ interface AllocationDao {
 
     @Query("SELECT * FROM allocations WHERE paymentDocId = :paymentDocId AND isVoided = 0")
     suspend fun getActiveAllocationsForPayment(paymentDocId: String): List<AllocationEntity>
+
+    @Query("SELECT * FROM allocations WHERE isVoided = 0")
+    fun getAllActiveAllocationsFlow(): Flow<List<AllocationEntity>>
+
+    @Query("SELECT * FROM allocations WHERE isVoided = 0")
+    suspend fun getAllActiveAllocationsSync(): List<AllocationEntity>
 
     @Query("UPDATE allocations SET isVoided = 1 WHERE paymentDocId = :docId OR invoiceDocId = :docId")
     suspend fun voidAllocationsForDoc(docId: String)
@@ -248,11 +372,20 @@ interface AssetDao {
     @Query("SELECT * FROM assets WHERE isDisposed = 0 ORDER BY purchaseDateEpochDay DESC")
     fun getAllActiveAssetsFlow(): Flow<List<AssetEntity>>
 
+    @Query("SELECT * FROM assets ORDER BY purchaseDateEpochDay DESC")
+    suspend fun getAllAssetsSync(): List<AssetEntity>
+
+    @Query("UPDATE assets SET isDisposed = :isDisposed WHERE id = :id")
+    suspend fun setAssetDisposed(id: String, isDisposed: Boolean)
+
     @Insert(onConflict = OnConflictStrategy.ABORT)
     suspend fun insertDepreciationRun(run: DepreciationRunEntity)
 
     @Query("SELECT COUNT(*) FROM depreciation_runs WHERE periodYear = :year AND periodMonth = :month AND assetId = :assetId")
     suspend fun countDepreciationRun(year: Int, month: Int, assetId: String): Int
+
+    @Query("SELECT * FROM depreciation_runs")
+    suspend fun getAllDepreciationRunsSync(): List<DepreciationRunEntity>
 
     @Query("UPDATE assets SET accumulatedDepreciationMinor = accumulatedDepreciationMinor + :amountMinor WHERE id = :assetId")
     suspend fun incrementAccumulatedDepreciation(assetId: String, amountMinor: Long)
@@ -269,8 +402,20 @@ interface CardPackageDao {
     @Query("SELECT * FROM card_packages WHERE isActive = 1 ORDER BY name ASC")
     fun getAllPackagesFlow(): Flow<List<CardPackageEntity>>
 
+    @Query("SELECT * FROM card_packages ORDER BY name ASC")
+    suspend fun getAllPackagesSync(): List<CardPackageEntity>
+
+    @Query("UPDATE card_packages SET isActive = :isActive WHERE id = :id")
+    suspend fun setPackageActive(id: String, isActive: Boolean)
+
     @Insert(onConflict = OnConflictStrategy.ABORT)
     suspend fun insertStockMovement(movement: StockMovementEntity)
+
+    @Query("SELECT * FROM stock_movements ORDER BY movementDateEpochDay DESC, createdAt DESC")
+    fun getAllStockMovementsFlow(): Flow<List<StockMovementEntity>>
+
+    @Query("SELECT * FROM stock_movements ORDER BY movementDateEpochDay DESC, createdAt DESC")
+    suspend fun getAllStockMovementsSync(): List<StockMovementEntity>
 
     @Query("""
         SELECT COALESCE(SUM(
