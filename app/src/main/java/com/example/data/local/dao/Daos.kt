@@ -1,0 +1,345 @@
+package com.example.data.local.dao
+
+import androidx.room.Dao
+import androidx.room.Insert
+import androidx.room.OnConflictStrategy
+import androidx.room.Query
+import androidx.room.Update
+import com.example.data.local.entity.AccountEntity
+import com.example.data.local.entity.AllocationEntity
+import com.example.data.local.entity.AssetEntity
+import com.example.data.local.entity.AuditLogEntity
+import com.example.data.local.entity.CardPackageEntity
+import com.example.data.local.entity.CurrencyRateEntity
+import com.example.data.local.entity.DepreciationRunEntity
+import com.example.data.local.entity.DocumentEntity
+import com.example.data.local.entity.DocumentItemEntity
+import com.example.data.local.entity.FiscalPeriodEntity
+import com.example.data.local.entity.IdempotencyKeyEntity
+import com.example.data.local.entity.JournalEntryEntity
+import com.example.data.local.entity.JournalLineEntity
+import com.example.data.local.entity.NumberSequenceEntity
+import com.example.data.local.entity.OrganizationEntity
+import com.example.data.local.entity.PartyEntity
+import com.example.data.local.entity.StockMovementEntity
+import com.example.data.local.entity.TreasuryAccountEntity
+import kotlinx.coroutines.flow.Flow
+
+data class AccountBalanceRow(
+    val accountCode: String,
+    val accountName: String,
+    val totalDebitMinor: Long,
+    val totalCreditMinor: Long,
+    val isDebitNormal: Boolean
+) {
+    val netBalanceMinor: Long get() = if (isDebitNormal) totalDebitMinor - totalCreditMinor else totalCreditMinor - totalDebitMinor
+}
+
+data class PartyBalanceRow(
+    val partyId: String,
+    val partyName: String,
+    val accountCode: String,
+    val totalDebitMinor: Long,
+    val totalCreditMinor: Long
+) {
+    val netBalanceMinor: Long get() = totalDebitMinor - totalCreditMinor
+}
+
+/**
+ * Journal entries and lines write access is restricted exclusively to LedgerWriter.
+ */
+@Dao
+internal interface JournalDao {
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    suspend fun insertEntry(entry: JournalEntryEntity)
+
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    suspend fun insertLines(lines: List<JournalLineEntity>)
+
+    @Query("SELECT * FROM journal_entries ORDER BY entryDateEpochDay DESC, entryNumber DESC")
+    fun getAllEntriesFlow(): Flow<List<JournalEntryEntity>>
+
+    @Query("SELECT * FROM journal_entries WHERE docId = :docId ORDER BY entryNumber ASC")
+    suspend fun getEntriesForDocument(docId: String): List<JournalEntryEntity>
+
+    @Query("SELECT * FROM journal_lines WHERE entryId = :entryId ORDER BY lineNo ASC")
+    suspend fun getLinesForEntry(entryId: String): List<JournalLineEntity>
+
+    @Query("SELECT * FROM journal_lines ORDER BY lineNo ASC")
+    fun getAllLinesFlow(): Flow<List<JournalLineEntity>>
+
+    @Query("""
+        SELECT a.code AS accountCode, a.name AS accountName,
+               COALESCE(SUM(jl.baseDebitMinor), 0) AS totalDebitMinor,
+               COALESCE(SUM(jl.baseCreditMinor), 0) AS totalCreditMinor,
+               a.isDebitNormal AS isDebitNormal
+        FROM accounts a
+        LEFT JOIN journal_lines jl ON a.code = jl.accountCode
+        GROUP BY a.code, a.name, a.isDebitNormal
+        ORDER BY a.code ASC
+    """)
+    fun getTrialBalanceFlow(): Flow<List<AccountBalanceRow>>
+
+    @Query("""
+        SELECT a.code AS accountCode, a.name AS accountName,
+               COALESCE(SUM(jl.baseDebitMinor), 0) AS totalDebitMinor,
+               COALESCE(SUM(jl.baseCreditMinor), 0) AS totalCreditMinor,
+               a.isDebitNormal AS isDebitNormal
+        FROM accounts a
+        LEFT JOIN journal_lines jl ON a.code = jl.accountCode
+        GROUP BY a.code, a.name, a.isDebitNormal
+        ORDER BY a.code ASC
+    """)
+    suspend fun getTrialBalanceSync(): List<AccountBalanceRow>
+
+    @Query("""
+        SELECT p.id AS partyId, p.name AS partyName, jl.accountCode AS accountCode,
+               COALESCE(SUM(jl.baseDebitMinor), 0) AS totalDebitMinor,
+               COALESCE(SUM(jl.baseCreditMinor), 0) AS totalCreditMinor
+        FROM parties p
+        INNER JOIN journal_lines jl ON p.id = jl.partyId
+        WHERE jl.accountCode = :controlAccountCode
+        GROUP BY p.id, p.name, jl.accountCode
+    """)
+    suspend fun getPartyBalancesForControlAccount(controlAccountCode: String): List<PartyBalanceRow>
+
+    @Query("""
+        SELECT COALESCE(SUM(baseDebitMinor) - SUM(baseCreditMinor), 0)
+        FROM journal_lines
+        WHERE accountCode = :accountCode
+    """)
+    suspend fun getNetDebitBalanceForAccount(accountCode: String): Long
+
+    @Query("""
+        SELECT COALESCE(SUM(baseDebitMinor) - SUM(baseCreditMinor), 0)
+        FROM journal_lines
+        WHERE treasuryId = :treasuryId
+    """)
+    suspend fun getNetDebitBalanceForTreasury(treasuryId: String): Long
+
+    @Query("""
+        SELECT COALESCE(SUM(origMinor), 0)
+        FROM journal_lines
+        WHERE treasuryId = :treasuryId AND baseDebitMinor > 0
+    """)
+    suspend fun getTreasuryDebitOrigTotal(treasuryId: String): Long
+
+    @Query("""
+        SELECT COALESCE(SUM(origMinor), 0)
+        FROM journal_lines
+        WHERE treasuryId = :treasuryId AND baseCreditMinor > 0
+    """)
+    suspend fun getTreasuryCreditOrigTotal(treasuryId: String): Long
+}
+
+@Dao
+interface DocumentDao {
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    suspend fun insertDocument(doc: DocumentEntity)
+
+    @Update
+    suspend fun updateDocument(doc: DocumentEntity)
+
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    suspend fun insertItems(items: List<DocumentItemEntity>)
+
+    @Query("SELECT * FROM documents WHERE id = :id")
+    suspend fun getDocumentById(id: String): DocumentEntity?
+
+    @Query("SELECT * FROM documents ORDER BY dateEpochDay DESC, docNumber DESC")
+    fun getAllDocumentsFlow(): Flow<List<DocumentEntity>>
+
+    @Query("SELECT * FROM documents WHERE type = :type ORDER BY dateEpochDay DESC, docNumber DESC")
+    fun getDocumentsByTypeFlow(type: String): Flow<List<DocumentEntity>>
+
+    @Query("SELECT * FROM document_items WHERE docId = :docId ORDER BY itemIndex ASC")
+    suspend fun getItemsForDocument(docId: String): List<DocumentItemEntity>
+}
+
+@Dao
+interface PartyDao {
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    suspend fun insertParty(party: PartyEntity)
+
+    @Update
+    suspend fun updateParty(party: PartyEntity)
+
+    @Query("SELECT * FROM parties WHERE id = :id")
+    suspend fun getPartyById(id: String): PartyEntity?
+
+    @Query("SELECT * FROM parties ORDER BY name ASC")
+    fun getAllPartiesFlow(): Flow<List<PartyEntity>>
+
+    @Query("SELECT * FROM parties WHERE isCustomer = 1 ORDER BY name ASC")
+    fun getCustomersFlow(): Flow<List<PartyEntity>>
+
+    @Query("SELECT * FROM parties WHERE isVendor = 1 ORDER BY name ASC")
+    fun getVendorsFlow(): Flow<List<PartyEntity>>
+
+    @Query("SELECT * FROM parties WHERE isPartner = 1 ORDER BY name ASC")
+    fun getPartnersFlow(): Flow<List<PartyEntity>>
+}
+
+@Dao
+interface TreasuryDao {
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    suspend fun insertTreasury(treasury: TreasuryAccountEntity)
+
+    @Query("SELECT * FROM treasury_accounts WHERE id = :id")
+    suspend fun getTreasuryById(id: String): TreasuryAccountEntity?
+
+    @Query("SELECT * FROM treasury_accounts WHERE isActive = 1 ORDER BY name ASC")
+    fun getAllTreasuriesFlow(): Flow<List<TreasuryAccountEntity>>
+
+    @Query("SELECT * FROM treasury_accounts WHERE isActive = 1 ORDER BY name ASC")
+    suspend fun getAllTreasuriesSync(): List<TreasuryAccountEntity>
+}
+
+@Dao
+interface AccountDao {
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertAccounts(accounts: List<AccountEntity>)
+
+    @Query("SELECT * FROM accounts WHERE code = :code")
+    suspend fun getAccountByCode(code: String): AccountEntity?
+
+    @Query("SELECT * FROM accounts ORDER BY code ASC")
+    fun getAllAccountsFlow(): Flow<List<AccountEntity>>
+
+    @Query("SELECT * FROM accounts ORDER BY code ASC")
+    suspend fun getAllAccountsSync(): List<AccountEntity>
+}
+
+@Dao
+interface FiscalPeriodDao {
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertPeriod(period: FiscalPeriodEntity)
+
+    @Query("SELECT * FROM fiscal_periods WHERE year = :year AND month = :month")
+    suspend fun getPeriod(year: Int, month: Int): FiscalPeriodEntity?
+
+    @Query("UPDATE fiscal_periods SET isClosed = :isClosed, closedAt = :closedAt WHERE year = :year AND month = :month")
+    suspend fun setPeriodClosed(year: Int, month: Int, isClosed: Boolean, closedAt: Long?)
+}
+
+@Dao
+interface AllocationDao {
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    suspend fun insertAllocation(allocation: AllocationEntity)
+
+    @Query("SELECT * FROM allocations WHERE invoiceDocId = :invoiceDocId AND isVoided = 0")
+    suspend fun getActiveAllocationsForInvoice(invoiceDocId: String): List<AllocationEntity>
+
+    @Query("SELECT * FROM allocations WHERE paymentDocId = :paymentDocId AND isVoided = 0")
+    suspend fun getActiveAllocationsForPayment(paymentDocId: String): List<AllocationEntity>
+
+    @Query("UPDATE allocations SET isVoided = 1 WHERE paymentDocId = :docId OR invoiceDocId = :docId")
+    suspend fun voidAllocationsForDoc(docId: String)
+}
+
+@Dao
+interface AssetDao {
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    suspend fun insertAsset(asset: AssetEntity)
+
+    @Query("SELECT * FROM assets WHERE id = :id")
+    suspend fun getAssetById(id: String): AssetEntity?
+
+    @Query("SELECT * FROM assets WHERE isDisposed = 0 ORDER BY purchaseDateEpochDay DESC")
+    fun getAllActiveAssetsFlow(): Flow<List<AssetEntity>>
+
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    suspend fun insertDepreciationRun(run: DepreciationRunEntity)
+
+    @Query("SELECT COUNT(*) FROM depreciation_runs WHERE periodYear = :year AND periodMonth = :month AND assetId = :assetId")
+    suspend fun countDepreciationRun(year: Int, month: Int, assetId: String): Int
+
+    @Query("UPDATE assets SET accumulatedDepreciationMinor = accumulatedDepreciationMinor + :amountMinor WHERE id = :assetId")
+    suspend fun incrementAccumulatedDepreciation(assetId: String, amountMinor: Long)
+}
+
+@Dao
+interface CardPackageDao {
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    suspend fun insertPackage(pkg: CardPackageEntity)
+
+    @Query("SELECT * FROM card_packages WHERE id = :id")
+    suspend fun getPackageById(id: String): CardPackageEntity?
+
+    @Query("SELECT * FROM card_packages WHERE isActive = 1 ORDER BY name ASC")
+    fun getAllPackagesFlow(): Flow<List<CardPackageEntity>>
+
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    suspend fun insertStockMovement(movement: StockMovementEntity)
+
+    @Query("""
+        SELECT COALESCE(SUM(
+            CASE
+                WHEN type IN ('RECEIVE', 'RETURN') THEN quantity
+                WHEN type IN ('SELL') THEN -quantity
+                WHEN type IN ('ADJUST') THEN quantity
+                ELSE 0
+            END
+        ), 0)
+        FROM stock_movements
+        WHERE packageId = :packageId
+    """)
+    suspend fun getStockBalance(packageId: String): Int
+}
+
+@Dao
+interface NumberSequenceDao {
+    @Query("SELECT * FROM number_sequences WHERE docType = :docType AND fiscalYear = :fiscalYear")
+    suspend fun getSequence(docType: String, fiscalYear: Int): NumberSequenceEntity?
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertSequence(sequence: NumberSequenceEntity)
+
+    @Query("UPDATE number_sequences SET nextValue = :nextValue WHERE docType = :docType AND fiscalYear = :fiscalYear")
+    suspend fun updateNextValue(docType: String, fiscalYear: Int, nextValue: Long)
+}
+
+@Dao
+interface CurrencyRateDao {
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertRate(rate: CurrencyRateEntity)
+
+    @Query("UPDATE currency_rates SET rateMicros = :rateMicros, updatedAt = :updatedAt WHERE fromCurrency = :fromCurrency AND toCurrency = :toCurrency")
+    suspend fun updateRate(fromCurrency: String, toCurrency: String, rateMicros: Long, updatedAt: Long)
+
+    @Query("SELECT * FROM currency_rates WHERE fromCurrency = :fromCurrency AND toCurrency = :toCurrency")
+    suspend fun getRate(fromCurrency: String, toCurrency: String): CurrencyRateEntity?
+
+    @Query("SELECT * FROM currency_rates")
+    fun getAllRatesFlow(): Flow<List<CurrencyRateEntity>>
+}
+
+@Dao
+interface AuditLogDao {
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    suspend fun insertLog(log: AuditLogEntity)
+}
+
+@Dao
+interface IdempotencyDao {
+    @Query("SELECT docId FROM idempotency_keys WHERE `key` = :key")
+    suspend fun getDocIdForKey(key: String): String?
+
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    suspend fun insertKey(entry: IdempotencyKeyEntity)
+}
+
+@Dao
+interface OrganizationDao {
+    @Query("SELECT * FROM organizations LIMIT 1")
+    suspend fun getOrganizationSync(): OrganizationEntity?
+
+    @Query("SELECT * FROM organizations LIMIT 1")
+    fun getOrganizationFlow(): Flow<OrganizationEntity?>
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertOrganization(org: OrganizationEntity)
+
+    @Update
+    suspend fun updateOrganization(org: OrganizationEntity)
+}
